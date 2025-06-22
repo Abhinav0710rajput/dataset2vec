@@ -6,13 +6,14 @@ Created on Fri Sep 25 16:21:42 2020
 @author: hsjomaa
 """
 
-import tensorflow as tf
+import torch
 import pandas as pd
 import random
 import numpy as np
 np.random.seed(318)
 random.seed(3718)
-tf.random.set_seed(0)
+torch.manual_seed(0)
+
 class Batch(object):
     
     def __init__(self,batch_size,fixed_shape = True):
@@ -47,13 +48,15 @@ class Batch(object):
     def collect(self):
         
         if len(self.x)!= self.batch_size and self.fixed_shape:
-            raise(f'Batch formation incomplete!\n{len(self.x)}!={self.batch_size}')
-        self.input = (tf.concat(self.x,axis=0),
-                      tf.cast(tf.transpose(tf.concat(self.classes,axis=0)),dtype=tf.int32),
-                      tf.cast(tf.transpose(tf.concat(self.features,axis=0)),dtype=tf.int32),
-                      tf.cast(tf.transpose(tf.concat(self.instances,axis=0)),dtype=tf.int32),
+            raise Exception(f'Batch formation incomplete!\n{len(self.x)}!={self.batch_size}')
+        
+        # Convert numpy arrays to tensors before concatenating
+        self.input = (torch.cat([torch.from_numpy(i) for i in self.x], axis=0).float(),
+                      torch.tensor(self.classes).flatten().long(),
+                      torch.tensor(self.features).flatten().long(),
+                      torch.tensor(self.instances).flatten().long(),
                       )
-        self.output = {'similaritytarget':tf.concat([tf.ones(self.batch_size),tf.zeros(self.batch_size)],axis=0)}
+        self.output = {'similaritytarget':torch.cat([torch.ones(self.batch_size),torch.zeros(self.batch_size)],axis=0)}
 
 def pool(n,ntotal,shuffle):
     _pool = [_ for _ in list(range(ntotal)) if _!= n]

@@ -7,7 +7,8 @@ Created on Fri Nov 20 00:16:56 2020
 """
 from dataset import Dataset
 from sampling import Batch,Sampling,TestSampling
-import tensorflow as tf
+import torch
+import torch.optim as optim
 import copy
 import json
 from model import Model
@@ -15,19 +16,22 @@ import numpy as np
 import argparse
 from sklearn.metrics import roc_auc_score
 import os
+import pandas as pd
+
 # set random seeds
-tf.random.set_seed(0)
+torch.manual_seed(0)
 np.random.seed(42)
 #---------------------------------
 # create parser
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--configuration', help='Select model configuration', type=int,default=0)
 parser.add_argument('--split', help='Select training fold', type=int,default=0)
-parser.add_argument('--LookAhead', help='Implement lookahead on backend optimizer', type=str,choices=['True','False'],default='False')
 parser.add_argument('--searchspace', help='Select metadataset',choices=['a','b','c'], type=str,default='a')
 parser.add_argument('--learning_rate', help='Learning rate',type=float,default=1e-3)
 parser.add_argument('--delta', help='negative datasets weight',type=float,default=2)
 parser.add_argument('--gamma', help='distance hyperparameter',type=float,default=1)
+parser.add_argument('--device', help='Device to use for training (e.g., "cpu" or "cuda:0")', type=str, default='cpu')
+
 
 args    = parser.parse_args()
 
@@ -39,109 +43,113 @@ configuration = json.load(open(config_file,'r'))
 # update with shared configurations with specifics
 config_specs = {
     'split':	args.split,
-    'LookAhead':	eval(args.LookAhead),
     'searchspace':	args.searchspace,
     'learning_rate':	args.learning_rate,
     'delta':	args.delta,
     'gamma':	args.gamma,
     'minmax':	True,    
     'batch_size':	16,
+    'input_shape': 2,
     }
 
 configuration.update(config_specs)
 
 searchspaceinfo = json.load(open(info_file,'r'))
 configuration.update(searchspaceinfo[args.searchspace])
+device = torch.device(args.device)
 
 # create Dataset
-normalized_dataset         = Dataset(configuration,rootdir,use_valid=True)
+normalized_dataset = Dataset(configuration,rootdir,use_valid=True)
 
 # load training sets
 nsource = len(normalized_dataset.orig_data['train'])
 ntarget = len(normalized_dataset.orig_data['valid'])
 ntest   = len(normalized_dataset.orig_data['test'])
-# learning rate scheduler
-optimizer        = tf.keras.optimizers.Adam(configuration['learning_rate'])
-# create training model
+
 # create model
-model     = Model(configuration,rootdir=rootdir)
+model     = Model(configuration,rootdir=rootdir).to(device)
+optimizer = optim.Adam(model.parameters(), lr=configuration['learning_rate'])
 batch     = Batch(configuration['batch_size'])
-# create evaluation model (for validation)
-
-testconfiguration = copy.copy(configuration)
-testconfiguration['batch_size'] = 16 if args.searchspace != 'c' else 18
-
-testmodel   = Model(testconfiguration,rootdir=rootdir,for_eval=True)
-testbatch   = Batch(testconfiguration['batch_size'])
-
-# define list/csv tracking
-print(model.model.summary())
 
 # Define training parameters
 epochs = 10000
-# reset metric trackers
-model.reset_states()    
-
-# Start training56
 sampler     = Sampling(dataset=normalized_dataset)
 testsampler = TestSampling(dataset=normalized_dataset)
 
 early = 0
 best_auc = -np.inf
-model.reset_states()  
 for epoch in range(epochs):
+    print(f"Epoch {epoch}")
+    
+    model.train()
     batch = sampler.sample(batch,split='train',sourcesplit='train')
     batch.collect()
-    metrics = model.train_step(x=batch.input,y=batch.output,optimizer=optimizer,clip=True)
-    if optimizer.iterations%50==0:
-        iteration = optimizer.iterations.numpy()
-        # save as current weights
-        model.save_weights(iteration=optimizer.iterations.numpy())
-        # reset evaluation mse tracker
-        savedir       = os.path.join(model.directory,f"iteration-{iteration}")
+
+    inputs = [d.to(device) for d in batch.input]
+    targets = batch.output['similaritytarget'].to(device)
+    
+    optimizer.zero_grad()
+    
+    outputs = model(inputs)
+    metafeatures = outputs['metafeatures']
+    
+    loss = model.similarityloss(targets, metafeatures)
+    
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+    optimizer.step()
+
+    if epoch % 50 == 0:
+        model.eval()
         y_true = []
         y_pred = []
-        for _ in range(ntarget):
-            reuse = False
-            for q in range(10):
-                batch = testsampler.sample(batch,split='valid',sourcesplit='train',targetdataset=_)
-                reuse = True
-                batch.collect()
-                prob,label = model.predict(batch.input,batch.output)
-                y_pred.append(prob)
-                y_true.append(label)
-        auc_score = roc_auc_score(np.hstack(y_true),np.hstack(y_pred))
-        model._update_metrics(metrics={"roc":auc_score})
-        model.update_tracker(training=True,metrics=model.metrics)
-        model.report()
-        if np.abs(model.metrics['roc'].result().numpy()-best_auc)>1e-3:
+        with torch.no_grad():
+            for _ in range(ntarget):
+                for q in range(10):
+                    test_batch = testsampler.sample(batch,split='valid',sourcesplit='train',targetdataset=_)
+                    test_batch.collect()
+                    t_inputs = [d.to(device) for d in test_batch.input]
+                    t_outputs = {k: v.to(device) for k,v in test_batch.output.items()}
+
+                    prob,label = model.predict(t_inputs, t_outputs)
+                    y_pred.append(prob.cpu().numpy())
+                    y_true.append(label.cpu().numpy())
+
+        y_true = np.hstack(y_true)
+        y_pred = np.hstack(y_pred)
+        auc_score = roc_auc_score(y_true, y_pred)
+        print(f"Epoch {epoch}, Loss: {loss.item()}, Validation AUC: {auc_score}")
+        
+        if np.abs(auc_score - best_auc) > 1e-3:
             best_auc = auc_score
             early = 0
+            torch.save(model.state_dict(), os.path.join(model.directory, "model.pth"))
         else:
             early +=1
-    model.dump()
+
     sampler_file = os.path.join(model.directory,"distribution.csv")
     sampler.distribution.to_csv(sampler_file)
     testsampler.distribution.to_csv(os.path.join(model.directory,"valid-distribution.csv"))
     if early > 16:
         break
 
-model.save_weights(iteration=optimizer.iterations.numpy())   
-import pandas as pd
-metafeatures = pd.DataFrame(data=None)
-splitmf = [];
+torch.save(model.state_dict(), os.path.join(model.directory, "model.pth"))
+
+metafeatures_df = pd.DataFrame(data=None)
+splitmf = []
 filesmf = []
-for splits in [("train",nsource),("valid",ntarget),("test",ntest)]:
-    for _ in range(splits[1]):
-        datasetmf = []
-        reuse = False
-        for q in range(10):
-            batch = testsampler.sample(batch,split=splits[0],sourcesplit='train',targetdataset=_)
-            reuse = True
-            batch.collect()
-            datasetmf.append(model.getmetafeatures(batch.input))
-        splitmf.append(np.vstack(datasetmf).mean(axis=0)[None])
-    filesmf +=normalized_dataset.orig_files[splits[0]]
+model.eval()
+with torch.no_grad():
+    for splits in [("train",nsource),("valid",ntarget),("test",ntest)]:
+        for i in range(splits[1]):
+            datasetmf = []
+            for q in range(10):
+                batch = testsampler.sample(batch,split=splits[0],sourcesplit='train',targetdataset=i)
+                batch.collect()
+                b_inputs = [d.to(device) for d in batch.input]
+                datasetmf.append(model.getmetafeatures(b_inputs).cpu().numpy())
+            splitmf.append(np.vstack(datasetmf).mean(axis=0)[None])
+        filesmf +=normalized_dataset.orig_files[splits[0]]
 splitmf = np.vstack(splitmf)
-metafeatures = pd.DataFrame(data=splitmf,index=filesmf)
-metafeatures.to_csv(os.path.join(model.directory,"meta-feautures.csv"))
+metafeatures_df = pd.DataFrame(data=splitmf,index=filesmf)
+metafeatures_df.to_csv(os.path.join(model.directory,"meta-feautures.csv"))

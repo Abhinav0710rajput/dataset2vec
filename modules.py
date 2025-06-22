@@ -6,7 +6,8 @@ Created on Sun Nov 15 00:02:51 2020
 @author: hsjomaa
 """
 
-import tensorflow as tf
+import torch
+import torch.nn as nn
 
 def importance(config):
     if config['importance'] == 'linear':
@@ -14,7 +15,7 @@ def importance(config):
     elif config['importance'] == 'None':
         fn = None
     else:
-        raise('please define n importance function')
+        raise Exception('please define an importance function')
     return fn
     
 ARCHITECTURES = ['SQU','ASC','DES','SYM','ENC']
@@ -25,6 +26,7 @@ def get_units(idx,neurons,architecture,layers=None):
     elif architecture == 'ASC':
         return (2**idx)*neurons
     elif architecture == 'DES':
+        assert layers is not None, "layers must be specified for DES architecture"
         return (2**(layers-1-idx))*neurons    
     elif architecture=='SYM':
         assert (layers is not None and layers > 2)
@@ -46,185 +48,180 @@ def get_units(idx,neurons,architecture,layers=None):
             idx  = idx if idx < x else 2*x-idx
             return neurons*2**(int(layers/2) -idx)
 
-class Function(tf.keras.layers.Layer):
+def get_nonlinearity(nonlinearity):
+    if nonlinearity == 'relu':
+        return nn.ReLU()
+    elif nonlinearity == 'tanh':
+        return nn.Tanh()
+    elif nonlinearity == 'sigmoid':
+        return nn.Sigmoid()
+    else:
+        return getattr(nn, nonlinearity)()
 
-    def __init__(self, units, nhidden, nonlinearity,architecture,trainable):
+class ResidualBlock(nn.Module):
+    def __init__(self, units, nhidden, nonlinearity, architecture, trainable):
+        super().__init__()
+        self.n = nhidden
+        self.units = units
+        self.nonlinearity = get_nonlinearity(nonlinearity)
         
-        super(Function, self).__init__()
-        
-        self.n            = nhidden
-        self.units        = units        
-        self.nonlinearity = tf.keras.layers.Activation(nonlinearity)
-        self.block        = [tf.keras.layers.Dense(units=get_units(_,self.units,architecture,self.n),trainable=trainable) \
-                             for _ in range(self.n)]
-            
-    def call(self):
-        raise Exception("Call not implemented")
+        layers = []
+        for i in range(self.n):
+            layer = nn.Linear(self.units, self.units)
+            if not trainable:
+                for param in layer.parameters():
+                    param.requires_grad = False
+            layers.append(layer)
+        self.block = nn.ModuleList(layers)
 
-class ResidualBlock(Function):
-
-    def __init__(self, units, nhidden, nonlinearity,architecture,trainable):
-
-        super().__init__(units, nhidden, nonlinearity,architecture,trainable)
-            
-    def call(self, x):
-        e = x + 0
+    def forward(self, x):
+        residual = x
         for i, layer in enumerate(self.block):
-            e = layer(e)
+            x = layer(x)
             if i < (self.n - 1):
-                e = self.nonlinearity(e)
-        return self.nonlinearity(e + x)
-        
+                x = self.nonlinearity(x)
+        return self.nonlinearity(x + residual)
 
-class FunctionF(Function):
-    
-    def __init__(self, units, nhidden, nonlinearity,architecture,trainable, resblocks=0):
-        # m number of residual blocks
-        super().__init__(units, nhidden, nonlinearity,architecture,trainable)
-        # override function with residual blocks
-        self.resblocks=resblocks
-        if resblocks>0:
-            self.block        = [tf.keras.layers.Dense(units=self.units,trainable=trainable)]
-            assert(architecture=="SQU")
-            self.block       += [ResidualBlock(units=self.units,architecture=architecture,nhidden=self.n,trainable=trainable,nonlinearity=self.nonlinearity) \
-                                 for _ in range(resblocks)]                
-            self.block       += [tf.keras.layers.Dense(units=self.units,trainable=trainable)]
+class FunctionF(nn.Module):
+    def __init__(self, in_features, units, nhidden, nonlinearity, architecture, trainable, resblocks=0):
+        super().__init__()
+        self.resblocks = resblocks
+        self.nonlinearity = get_nonlinearity(nonlinearity)
         
-    def call(self, x):
-        e = x
+        layers = []
+        if resblocks > 0:
+            assert architecture == "SQU", "Residual blocks only supported for SQU architecture"
+            layers.append(nn.Linear(in_features, units))
+            for _ in range(resblocks):
+                layers.append(ResidualBlock(units=units, nhidden=nhidden, nonlinearity=nonlinearity, architecture=architecture, trainable=trainable))
+            layers.append(nn.Linear(units, units))
+        else:
+            current_dim = in_features
+            for i in range(nhidden):
+                output_dim = get_units(i, units, architecture, nhidden)
+                layers.append(nn.Linear(current_dim, output_dim))
+                current_dim = output_dim
         
-        for i,fc in enumerate(self.block):
-            
-            e = fc(e)
-            
-            # make sure activation only applied once!
+        self.block = nn.ModuleList(layers)
+        if not trainable:
+            for param in self.parameters():
+                param.requires_grad = False
+
+    def forward(self, x):
+        for i, fc in enumerate(self.block):
+            x = fc(x)
             if self.resblocks == 0:
-                e = self.nonlinearity(e)
+                x = self.nonlinearity(x)
             else:
-                # only first one
-                if i==0 or i == (len(self.block)-1):
-                    e = self.nonlinearity(e)    
+                if i == 0 or i == (len(self.block) - 1):
+                    x = self.nonlinearity(x)
+        return x
 
-        return e
-
-class PoolF(tf.keras.layers.Layer):
-
+class PoolF(nn.Module):
     def __init__(self,units):    
         super(PoolF, self).__init__()
-        
         self.units = units
         
-    def call(self,x,nclasses,nfeature,ninstanc):
-        
-        s = tf.multiply(nclasses,tf.multiply(nfeature,ninstanc))
-        
-        x           = tf.split(x,num_or_size_splits=s,axis=0)
+    def forward(self,x,nclasses,nfeature,ninstanc):
+
+        s = (nclasses * nfeature * ninstanc).view(-1).tolist()
+
+        x_split = torch.split(x, s, dim=0)
         
         e  = []
-        
-        for i,bx in enumerate(x):
+        for i,bx in enumerate(x_split):
+            te = bx.view(1,nclasses[i],nfeature[i],ninstanc[i],self.units)
+            te = torch.mean(te,axis=3)
+            e.append(te.view(nclasses[i]*nfeature[i],self.units))
             
-            te     = tf.reshape(bx,shape=(1,nclasses[i],nfeature[i],ninstanc[i],self.units))
-            
-            te     = tf.reduce_mean(te,axis=3)
-            e.append(tf.reshape(te,shape=(nclasses[i]*nfeature[i],self.units)))
-            
-        e = tf.concat(e,axis=0)
-        
-        return e
+        return torch.cat(e,axis=0)
     
-class FunctionG(Function):
-    def __init__(self, units, nhidden, nonlinearity,architecture,trainable):
+class FunctionG(nn.Module):
+    def __init__(self, in_features, units, nhidden, nonlinearity, architecture, trainable):
+        super().__init__()
+        self.nonlinearity = get_nonlinearity(nonlinearity)
         
-        super().__init__(units, nhidden, nonlinearity,architecture,trainable)
-    def call(self, x):
-        e = x
+        layers = []
+        current_dim = in_features
+        for i in range(nhidden):
+            output_dim = get_units(i, units, architecture, nhidden)
+            layers.append(nn.Linear(current_dim, output_dim))
+            current_dim = output_dim
         
+        self.block = nn.ModuleList(layers)
+        if not trainable:
+            for param in self.parameters():
+                param.requires_grad = False
+
+    def forward(self, x):
         for fc in self.block:
-            
-            e = fc(e)
-            
-            e = self.nonlinearity(e)
+            x = fc(x)
+            x = self.nonlinearity(x)
+        return x
 
-        return e
-
-class PoolG(tf.keras.layers.Layer):
-
+class PoolG(nn.Module):
     def __init__(self,units):    
         super(PoolG, self).__init__()
-        
         self.units = units
         
-    def call(self, x,nclasses,nfeature):
-        
-        s = tf.multiply(nclasses, nfeature)      
-        
-        x = tf.split(x,num_or_size_splits=s,axis=0)
+    def forward(self, x,nclasses,nfeature):
+        s = (nclasses * nfeature).tolist()
+        x_split = torch.split(x, s, dim=0)
         
         e  = []
-        
-        for i,bx in enumerate(x):
-            
-            te     = tf.reshape(bx,shape=(1,nclasses[i]*nfeature[i],self.units))
-            
-            te     = tf.reduce_mean(te,axis=1)
-            
+        for i,bx in enumerate(x_split):
+            te = bx.view(1,nclasses[i]*nfeature[i],self.units)
+            te = torch.mean(te,axis=1)
             e.append(te)
             
-        e = tf.concat(e,axis=0)
+        return torch.cat(e,axis=0)
 
-        return e
-    
-
-class FunctionH(Function):
-    def __init__(self, units, nhidden, nonlinearity,architecture,trainable, resblocks=0):
-        # m number of residual blocks
-        super().__init__(units, nhidden, nonlinearity,architecture,trainable)
-        # override function with residual blocks
+class FunctionH(nn.Module):
+    def __init__(self, in_features, units, nhidden, nonlinearity, architecture, trainable, resblocks=0):
+        super().__init__()
         self.resblocks = resblocks
-        if resblocks>0:
-            self.block        = [tf.keras.layers.Dense(units=self.units,trainable=trainable)]
-            assert(architecture=="SQU")
-            self.block       += [ResidualBlock(units=self.units,architecture=architecture,nhidden=self.n,trainable=trainable,nonlinearity=self.nonlinearity) \
-                                 for _ in range(resblocks)]                
-            self.block       += [tf.keras.layers.Dense(units=self.units,trainable=trainable)]
+        self.nonlinearity = get_nonlinearity(nonlinearity)
         
-    def call(self,x):
+        layers = []
+        if resblocks > 0:
+            assert architecture == "SQU", "Residual blocks only supported for SQU architecture"
+            layers.append(nn.Linear(in_features, units))
+            for _ in range(resblocks):
+                layers.append(ResidualBlock(units=units, nhidden=nhidden, nonlinearity=nonlinearity, architecture=architecture, trainable=trainable))
+            layers.append(nn.Linear(units, units))
+        else:
+            current_dim = in_features
+            for i in range(nhidden):
+                output_dim = get_units(i, units, architecture, nhidden)
+                layers.append(nn.Linear(current_dim, output_dim))
+                current_dim = output_dim
         
-        e = x
-        
+        self.block = nn.ModuleList(layers)
+        if not trainable:
+            for param in self.parameters():
+                param.requires_grad = False
+
+    def forward(self,x):
         for i,fc in enumerate(self.block):
-            
-            e = fc(e)
-            # make sure activation only applied once!
+            x = fc(x)
             if self.resblocks == 0:
-                if i<(len(self.blocks)-1):
-                    e = self.nonlinearity(e)
+                if i < len(self.block) - 1:
+                    x = self.nonlinearity(x)
             else:
-                # only first one
-                if i==0:
-                    e = self.nonlinearity(e)      
+                if i==0 or i == (len(self.block)-1):
+                    x = self.nonlinearity(x)
+        return x
 
-        return e
-
-
-class PoolH(tf.keras.layers.Layer):
+class PoolH(nn.Module):
     def __init__(self, batch_size,units):
-        """
-        """
         super(PoolH, self).__init__()
         self.batch_size = batch_size
         self.units = units
         
-    def call(self, x,ignore_negative):
-        
-        e  =  tf.reshape(x,shape=(self.batch_size,3,self.units))
-        # average positive meta-features
-        e1 = tf.reduce_mean(e[:,:2],axis=1)
+    def forward(self, x,ignore_negative):
+        e  =  x.view(self.batch_size,3,self.units)
+        e1 = torch.mean(e[:,:2],dim=1)
         if not ignore_negative:
-            # select negative meta-feautures 
-            e1 = e[:,-1][:,None]            
-        # reshape, i.e. output is [batch_size,nhidden]
-        e  = tf.reshape(e1,shape=(self.batch_size,self.units))            
-        
+            e1 = e[:,-1]
+        e  = e1.view(self.batch_size,self.units)            
         return e
