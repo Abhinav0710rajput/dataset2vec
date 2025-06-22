@@ -18,6 +18,7 @@ import os
 # set random seeds
 tf.random.set_seed(0)
 np.random.seed(42)
+#--------------------------------
 # create parser
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--configuration', help='Select model configuration', type=int,default=0)
