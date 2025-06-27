@@ -69,13 +69,24 @@ class Sampling(object):
         self.dataset          = dataset
         self.distribution     = pd.DataFrame(data=None,columns=['targetdataset','sourcedataset'])
         self.targetdataset   = None
+        self.sourcedataset   = None
 
     def sample(self,batch,split,sourcesplit):
         
-        nsource  = len(self.dataset.orig_data[sourcesplit])
-        ntarget  = len(self.dataset.orig_data[split])
-        targetdataset = np.random.choice(ntarget,batch.batch_size)
-        # clear batch
+        nsource  = len(self.dataset.orig_data[sourcesplit]) # number of source datasets 
+        ntarget  = len(self.dataset.orig_data[split]) # number of target datasets
+
+
+        # print(nsource, "nsource") #80
+        # print(ntarget, "ntarget") #80
+
+        targetdataset = np.random.choice(ntarget,batch.batch_size) 
+
+        #print the list of sampled dataset names in the targetdataset, not the indexes but the actual names
+        #print([self.dataset.orig_files[split][i] for i in targetdataset], "targetdataset")
+        
+
+
         batch.clear() 
         # find the negative dataset list of batch_size
         sourcedataset = []
@@ -96,6 +107,7 @@ class Sampling(object):
                                        pd.DataFrame(distribution,columns=['targetdataset','sourcedataset'])],axis=0,ignore_index=True)
             
         self.targetdataset   = targetdataset  
+        self.sourcedataset   = sourcedataset
         return batch
     
 class TestSampling(object):

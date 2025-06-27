@@ -72,12 +72,12 @@ class Model(nn.Module):
         os.makedirs(directory, exist_ok=True)
         return directory
     
-    def similarity(self,layer,positive_pair):
-        return torch.exp(-self.gamma*self.distance(layer,positive_pair))
+    def similarity(self,layer,positive_pair): #layer is the metafeatures
+        return torch.exp(-self.gamma*self.distance(layer,positive_pair)) #similarity is the exponential of the negative distance
     
     def distance(self,layer,positive_pair):
-        layer   = layer.view(self.batch_size,3,self.units_h)
-        if not positive_pair:
+        layer   = layer.view(self.batch_size,3,self.units_h) #layer is the metafeatures
+        if not positive_pair: 
             pos = torch.mean(layer[:,:2],axis=1).unsqueeze(1)
             neg = layer[:,-1].unsqueeze(1)
         else:
@@ -87,9 +87,9 @@ class Model(nn.Module):
         dist = torch.norm(pos - neg, p=2, dim=2)
         return dist.squeeze(1)
     
-    def similarityloss(self,target_y,predicted_y):
-        negative_prob   = self.similarity(predicted_y,positive_pair=False)
-        positive_prob   = self.similarity(predicted_y,positive_pair=True)
+    def similarityloss(self,target_y,predicted_y):  #target_y is the similarity score, predicted_y is the metafeatures
+        negative_prob   = self.similarity(predicted_y,positive_pair=False) #similarity of target train and target valid
+        positive_prob   = self.similarity(predicted_y,positive_pair=True) #similarity of target train and source train
         
         logits = torch.cat([positive_prob,negative_prob],axis=0)
         similarityweight = torch.cat([torch.ones(self.batch_size),self.delta*(torch.ones(self.batch_size))],axis=0).to(logits.device)
