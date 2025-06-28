@@ -99,90 +99,102 @@ Wiki for understanding the TRAINING code:
 
 
 
+base_training = True
+epochs = 500
 
+
+fine_tuning = True
+epochs_ft = 10000
 
 
 ######################################
 # TRAINING CODE USING AUXILIARY LOSS
 ######################################
 
-verbose = False
 
 early = 0
 best_auc = -np.inf
-for epoch in range(epochs):
-
-    
-    model.train()
-    batch = sampler.sample(batch,split='train',sourcesplit='train')
-    batch.collect() #collect the batch
+verbose = False
 
 
-    inputs = [d.to(device) for d in batch.input] 
+if base_training:
+    for epoch in range(epochs):
 
-
-    targets = batch.output['similaritytarget'].to(device)
-    
-    optimizer.zero_grad()
-    
-    outputs = model(inputs)
-    metafeatures = outputs['metafeatures']
-    
-    loss = model.similarityloss(targets, metafeatures)
-
-
-    #outputs is a dictionary with keys 'metafeatures'
-
-    if verbose:
-        print("--------------------------------")
-        print(sampler.targetdataset, "sampler.targetdataset")
-        print(batch.batch_size, "batch size")
-        print(outputs.keys(), "outputs keys")
-        print(outputs['metafeatures'].shape, "outputs metafeatures shape")
-        print(targets, "targets")
-        print(epoch,"<-epoch" , loss, "<-loss", metafeatures.shape, "<-metafeatures shape", targets.shape, "<-targets shape", inputs[0].shape, "<-inputs shape")
-        print("--------------------------------")
-
-    
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-    optimizer.step()
-
-    print(epoch,"<-epoch" , loss, "<-loss")
-
-    if epoch % 50 == 0:
-        model.eval()
-        y_true = []
-        y_pred = []
-        with torch.no_grad():
-            for _ in range(ntarget):
-                for q in range(10):
-                    test_batch = testsampler.sample(batch,split='valid',sourcesplit='train',targetdataset=_)
-                    test_batch.collect()
-                    t_inputs = [d.to(device) for d in test_batch.input]
-                    t_outputs = {k: v.to(device) for k,v in test_batch.output.items()}
-
-                    prob,label = model.predict(t_inputs, t_outputs)
-                    y_pred.append(prob.cpu().numpy())
-                    y_true.append(label.cpu().numpy())
-
-        y_true = np.hstack(y_true)
-        y_pred = np.hstack(y_pred)
-        auc_score = roc_auc_score(y_true, y_pred)
-        print(f"Epoch {epoch}, Loss: {loss.item()}, Validation AUC: {auc_score}")
         
-        if np.abs(auc_score - best_auc) > 1e-3:
-            best_auc = auc_score
-            early = 0
-            torch.save(model.state_dict(), os.path.join(model.directory, "model.pth"))
-        else:
-            early +=1
+        model.train()
+        batch = sampler.sample(batch,split='train',sourcesplit='train')
+        batch.collect() #collect the batch
 
-    sampler_file = os.path.join(model.directory,"distribution.csv")
-    sampler.distribution.to_csv(sampler_file)
-    testsampler.distribution.to_csv(os.path.join(model.directory,"valid-distribution.csv"))
-    if early > 16:
-        break
+
+        inputs = [d.to(device) for d in batch.input] 
+
+
+        targets = batch.output['similaritytarget'].to(device)
+        
+        optimizer.zero_grad()
+        
+        outputs = model(inputs)
+        metafeatures = outputs['metafeatures']
+
+        #check if metafeatures has nan values
+        if torch.isnan(metafeatures).any():
+            print("metafeatures has nan values")
+            exit()
+        
+        loss = model.similarityloss(targets, metafeatures)
+
+        #outputs is a dictionary with keys 'metafeatures'
+
+        if verbose:
+            print("--------------------------------")
+            print(sampler.targetdataset, "sampler.targetdataset")
+            print(batch.batch_size, "batch size")
+            print(outputs.keys(), "outputs keys")
+            print(outputs['metafeatures'].shape, "outputs metafeatures shape")
+            print(targets, "targets")
+            print(epoch,"<-epoch" , loss, "<-loss", metafeatures.shape, "<-metafeatures shape", targets.shape, "<-targets shape", inputs[0].shape, "<-inputs shape")
+            print("--------------------------------")
+
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        optimizer.step()
+
+        print(epoch,"<-epoch" , loss, "<-loss")
+
+        if epoch % 50 == 0:
+            model.eval()
+            y_true = []
+            y_pred = []
+            with torch.no_grad():
+                for _ in range(ntarget):
+                    for q in range(10):
+                        test_batch = testsampler.sample(batch,split='valid',sourcesplit='train',targetdataset=_)
+                        test_batch.collect()
+                        t_inputs = [d.to(device) for d in test_batch.input]
+                        t_outputs = {k: v.to(device) for k,v in test_batch.output.items()}
+
+                        prob,label = model.predict(t_inputs, t_outputs)
+                        y_pred.append(prob.cpu().numpy())
+                        y_true.append(label.cpu().numpy())
+
+            y_true = np.hstack(y_true)
+            y_pred = np.hstack(y_pred)
+            auc_score = roc_auc_score(y_true, y_pred)
+            print(f"Epoch {epoch}, Loss: {loss.item()}, Validation AUC: {auc_score}")
+            
+            if np.abs(auc_score - best_auc) > 1e-3:
+                best_auc = auc_score
+                early = 0
+                torch.save(model.state_dict(), os.path.join(model.directory, "model.pth"))
+            else:
+                early +=1
+
+        sampler_file = os.path.join(model.directory,"distribution.csv")
+        sampler.distribution.to_csv(sampler_file)
+        testsampler.distribution.to_csv(os.path.join(model.directory,"valid-distribution.csv"))
+        if early > 16:
+            break
 
 ######################################
 # FINE TUNING CODE USING FROBENIUOUS METRIC
@@ -190,20 +202,29 @@ for epoch in range(epochs):
 
 sanity_check = True
 
-def pairwise_distances_squared(A):
+def pairwise_distances_squared(A):    # NOT NUMERICALLY STABLE
     norms = (A ** 2).sum(dim=1, keepdim=True)
+
+    c = norms + norms.T - 2 * (A @ A.T)
+
+    #check if c has any NEGATIVE values
+    if c.min() < 0:
+        print("pairwise_distances_squared has negative values")
+        exit()
+    else:
+        print("pairwise_distances_squared does not have negative values")
+
     return norms + norms.T - 2 * (A @ A.T)
+
 
 data = pd.read_csv("ft_dataset/classifiers_performance.csv")
 print("fine tuning dataset loaded")
 
-batch_size_ft = 20 #batch size for fine tuning
-epochs_ft = 10000 #number of epochs for fine tuning
+batch_size_ft = 32 #batch size for fine tuning
 batch_ft    = Batch(batch_size_ft)
 
 
 for epoch_ft in range(epochs_ft):
-
 
 
     model.train()
@@ -214,7 +235,7 @@ for epoch_ft in range(epochs_ft):
 
     target_datasets = sampler.targetdataset
     #print the list of sampled dataset names in the targetdataset, not the indexes but the actual names
-    print([normalized_dataset.orig_files['train'][i] for i in target_datasets], "target datasets")
+    #print([normalized_dataset.orig_files['train'][i] for i in target_datasets], "target datasets")
 
 
     inputs = [d.to(device) for d in batch_ft.input] 
@@ -224,6 +245,13 @@ for epoch_ft in range(epochs_ft):
 
     outputs = model(inputs)
     metafeatures = outputs['metafeatures']
+
+    #check if metafeatures has nan values
+    # if torch.isnan(metafeatures).any():
+    #     print("metafeatures has nan values")
+    #     exit()
+    # else:
+    #     print("metafeatures does not have nan values")
 
     #set of unique metafeatures
     mfs_1 = metafeatures[:batch_size_ft, :] # Unique datasets
@@ -267,49 +295,85 @@ for epoch_ft in range(epochs_ft):
     X2 =  mfs_2_new # N, 32
 
 
-    R = torch.stack([
-    torch.tensor(
-        data[data['Dataset'] == name][['DT', 'RF', 'SVM', 'NB', 'KNN']].values[0],
-        dtype=torch.float32,
-        device=device
-    )
-    for name in filtered_datasets
-    ])  # N, 5
+    #check if X1 has nan values
+    if torch.isnan(X1).any():
+        print("X1 has nan values")
+        exit()
+    if torch.isnan(X2).any():
+        print("X2 has nan values")
+        exit()
 
 
-    dd_matrix = pairwise_distances_squared(X1)
-
-    
-
-    ######  OPTIONAL ########
-    diag_dist = ((X1 - X2) ** 2).sum(dim=1)  # shape: (N,)
-    dd_matrix.fill_diagonal_(0)              # Clear diagonal
-    dd_matrix += torch.diag(diag_dist)       # Insert custom diagonal
-    ##########################
-
-    #normalize the dd_matrix and R
+    # R = torch.stack([
+    # torch.tensor(
+    #     data[data['Dataset'] == name][['DT', 'RF', 'SVM', 'NB', 'KNN']].values[0],
+    #     dtype=torch.float32,
+    #     device=device
+    # )
+    # for name in filtered_datasets
+    # ])  # N, 5
 
 
-    print("dd_matrix", dd_matrix, "R", R)
+    # dd_matrix = pairwise_distances_squared(X1)
 
-    dr_matrix = pairwise_distances_squared(R)
 
-    loss = ((dd_matrix.sqrt() - dr_matrix.sqrt()) ** 2).sum()
+    # ######  OPTIONAL ########
+    # diag_dist = ((X1 - X2) ** 2).sum(dim=1)  # shape: (N,)
+    # dd_matrix.fill_diagonal_(0)              # Clear diagonal
+    # dd_matrix += torch.diag(diag_dist)       # Insert custom diagonal
+    # ##########################
 
-    # for i in range(len(filtered_datasets)):
-    #     for j in range(len(filtered_datasets)):
-    #         if i != j:
-    #             dd = torch.norm(mfs_1_new[i] - mfs_1_new[j], p=2)
-    #             rs_i = torch.tensor(data[data['Dataset'] == filtered_datasets[i]][['DT', 'RF', 'SVM', 'NB', 'KNN']].values,dtype=torch.float32,device=device)
-    #             rs_j = torch.tensor(data[data['Dataset'] == filtered_datasets[j]][['DT', 'RF', 'SVM', 'NB', 'KNN']].values,dtype=torch.float32,device=device)
-    #             dr = torch.norm(rs_i - rs_j, p=2)
-    #             loss += (dd - dr)**2
-    #         else: #i == j
-    #             dd = torch.norm(mfs_1_new[i] - mfs_2_new[j], p=2)
-    #             rs_i = torch.tensor(data[data['Dataset'] == filtered_datasets[i]][['DT', 'RF', 'SVM', 'NB', 'KNN']].values,dtype=torch.float32,device=device)
-    #             rs_j = torch.tensor(data[data['Dataset'] == filtered_datasets[j]][['DT', 'RF', 'SVM', 'NB', 'KNN']].values,dtype=torch.float32,device=device)
-    #             dr = torch.norm(rs_i - rs_j, p=2)
-    #             loss += (dd - dr)**2
+    # #check if dd_matrix has nan values
+    # if torch.isnan(dd_matrix).any():
+    #     print("dd_matrix has nan values")
+    #     exit()
+    # else:
+    #     print("dd_matrix does not have nan values")
+    # if torch.isnan(R).any():
+    #     print("R has nan values")
+    #     exit()
+    # else:
+    #     print("R does not have nan values")
+
+    # dr_matrix = pairwise_distances_squared(R)
+
+    # if torch.isnan(dr_matrix).any():
+    #     print("dr_matrix has nan values")
+    #     exit()
+    # else:
+    #     print("dr_matrix does not have nan values")
+
+    # #print max and min of dd_matrix and dr_matrix
+    # print("max of dd_matrix", dd_matrix.max(), "min of dd_matrix", dd_matrix.min())
+    # print("max of dr_matrix", dr_matrix.max(), "min of dr_matrix", dr_matrix.min())
+
+    # loss = ((dd_matrix.sqrt() - dr_matrix.sqrt()) ** 2).sum()
+
+    # BAD APPROACH BUT NOT NUMERICALLY STABLE
+    for i in range(len(filtered_datasets)):
+        for j in range(len(filtered_datasets)):
+            if i != j:
+                dd = torch.norm(mfs_1_new[i] - mfs_1_new[j], p=2)
+                rs_i = torch.tensor(data[data['Dataset'] == filtered_datasets[i]][['DT', 'RF', 'SVM', 'NB', 'KNN']].values,dtype=torch.float32,device=device)
+                rs_j = torch.tensor(data[data['Dataset'] == filtered_datasets[j]][['DT', 'RF', 'SVM', 'NB', 'KNN']].values,dtype=torch.float32,device=device)
+                dr = torch.norm(rs_i - rs_j, p=2)
+                loss += (dd - dr)**2
+            else: #i == j
+                dd = torch.norm(mfs_1_new[i] - mfs_2_new[j], p=2)
+                rs_i = torch.tensor(data[data['Dataset'] == filtered_datasets[i]][['DT', 'RF', 'SVM', 'NB', 'KNN']].values,dtype=torch.float32,device=device)
+                rs_j = torch.tensor(data[data['Dataset'] == filtered_datasets[j]][['DT', 'RF', 'SVM', 'NB', 'KNN']].values,dtype=torch.float32,device=device)
+                dr = torch.norm(rs_i - rs_j, p=2)
+                loss += (dd - dr)**2
+
+    print(len(filtered_datasets), "number of filtered datasets")
+
+    loss = loss / (len(filtered_datasets) * (len(filtered_datasets)))
+
+
+    #check if loss has nan values
+    if torch.isnan(loss):
+        print("loss has nan values")
+        exit()
     
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)

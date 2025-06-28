@@ -110,6 +110,7 @@ class Model(nn.Module):
         return proba,y["similaritytarget"]
         
     def forward(self, x):
+
         x_in, nclasses, nfeature, ninstanc = x
         layer    = self.function_f(x_in)
         layer    = self.pool_f(layer,nclasses,nfeature,ninstanc)
