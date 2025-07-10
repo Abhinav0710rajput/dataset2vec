@@ -100,7 +100,7 @@ Wiki for understanding the TRAINING code:
 
 
 base_training = True
-epochs = 500
+epochs = 10000
 
 
 fine_tuning = True
